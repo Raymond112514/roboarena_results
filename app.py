@@ -150,6 +150,70 @@ def _synced_videos_html(items: list[tuple[str, Path]]) -> str:
     # fmt: on
 
 
+# Token order I0..T1 for attention-mask examples (8×8).
+_MASK_TOKEN_LABELS: tuple[str, ...] = ("I0", "I1", "I2", "A0", "A1", "PAD", "T0", "T1")
+
+# Step 1: block-causal
+_MASK_BLOCK_CAUSAL: list[list[int]] = [
+    [1, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+# Step 2: block attention for images
+_MASK_BLOCK_IMAGE: list[list[int]] = [
+    [1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+# Step 3: zero out padding
+_MASK_PAD_ZERO: list[list[int]] = [
+    [1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 0, 1, 0],
+    [1, 1, 1, 1, 1, 0, 1, 1],
+]
+
+
+def _mask_matrix_html(mat: list[list[int]]) -> str:
+    """Render an 8×8 0/1 mask as a centered, column-aligned table."""
+    labels = _MASK_TOKEN_LABELS
+    col_h = "".join(
+        f'<th scope="col" style="padding:4px 10px;">{html_stdlib.escape(l)}</th>' for l in labels
+    )
+    body: list[str] = []
+    for i, rlabel in enumerate(labels):
+        cells = "".join(
+            f'<td style="padding:4px 10px;text-align:center;">{mat[i][j]}</td>' for j in range(8)
+        )
+        body.append(
+            "<tr>"
+            f'<th scope="row" style="padding:4px 10px;text-align:right;">{html_stdlib.escape(rlabel)}</th>'
+            f"{cells}</tr>"
+        )
+    return (
+        '<div style="text-align:center;width:100%;overflow-x:auto;">'
+        "<table"
+        ' style="border-collapse:collapse;margin:0.35em auto;'
+        "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:0.8rem;"
+        'border:1px solid rgba(0,0,0,0.12);">'
+        f"<thead><tr><th></th>{col_h}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Trajectory comparison", layout="wide")
     st.title("Bageljax Value Function Visualization")
@@ -204,8 +268,55 @@ def main() -> None:
         )
 
     st.divider()
-    with st.expander("Info"):
-        st.write("id 0-39 is training set, id 40-46 is testing set")
+    with st.expander("Experiment Details"):
+        st.markdown(
+            r"""### Experiment details
+
+**Observation**: shoulder images.
+
+**Action**: 8D (joint velocity and a binarized gripper), normalized with mean and standard deviation estimated from DROID actions, with action chunk size 30, projected to 30 tokens with an MLP. 
+
+**Target**: The model takes $s_t$, $a_t$, and language instruction $\ell$, and estimates the next-state value $V(s_{t+1})$. Both values lie in $[0, 1]$ and are projected to discretized value buckets same as before. DROID uses MC target (next state), Roboarena uses Robometer progress indication as the target.
+
+**Data sampling**: half the batch is sampled from DROID and half from Roboarena.
+
+**Dropout**: random observation masking so the model must use action information.
+"""
+        )
+        st.markdown("---")
+        st.markdown(
+            r"""### Implementation details
+
+**RoPE ID**
+
+* **Full-sequence** RoPE id is `[image RoPE | action RoPE | text RoPE]` (concatenated).
+* **Image RoPE id:** all $0$, defined in the loss function.
+* **Action RoPE id:** for the sequence $[a_1, a_2, \ldots]$, the RoPE id is $[1, 2, \ldots]$.
+* **Text RoPE id:** In `tokenize_and_pad`, for $[\text{PAD}, \text{PAD}, \text{PAD}, t_1, t_2, t_3, \ldots]$ the RoPE id is $[0,0,0,1,2,3,\ldots]$, then shifted by $n_{\text{actions}} = 30$ to $[0,0,0,31,32,33,\ldots]$.
+
+**Attention mask** (rows/columns: `I0` `I1` `I2` `A0` `A1` `PAD` `T0` `T1`).
+
+"""
+        )
+        st.markdown(
+            "* **Step 1:** prepare a **block-causal** mask.",
+        )
+        st.markdown(_mask_matrix_html(_MASK_BLOCK_CAUSAL), unsafe_allow_html=True)
+        st.markdown(
+            "* **Step 2:** **block attention for images**.",
+        )
+        st.markdown(_mask_matrix_html(_MASK_BLOCK_IMAGE), unsafe_allow_html=True)
+        st.markdown(
+            "* **Step 3:** **zero out padding** entries.",
+        )
+        st.markdown(_mask_matrix_html(_MASK_PAD_ZERO), unsafe_allow_html=True)
+        st.markdown(
+            r"""**Dropout**
+
+* With probability $p$, image tokens are replaced with padding; the attention mask then zeroes out those positions (same as for pad tokens in the masks above).
+* That random image dropout nudges the model to rely on action and other non-image signals.
+"""
+        )
     st.subheader(choice)
 
     paths = trajectory_paths(choice)
